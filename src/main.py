@@ -259,6 +259,77 @@ def cmd_checkout(commit_hash):
     # Update the Index to match this commit
     print(f"Switched to commit {commit_hash[:7]}")
 
+def cmd_log():
+    """Traverses the commit graph and prints the history."""
+    # Find the starting point (the latest commit hash)
+    master_path = os.path.join(".git", "refs", "heads", "master")
+    if not os.path.exists(master_path):
+        print("No commits yet.")
+        return
+
+    with open(master_path, "r") as f:
+        current_hash = f.read().strip()
+
+    # Walk backwards through the parents
+    while current_hash:
+        obj_type, data = read_object(current_hash)
+        content = data.decode()
+        
+        # Simple parsing to find parent and message
+        lines = content.splitlines()
+        parent = None
+        message = ""
+        
+        msg_start = content.find("\n\n")
+        message = content[msg_start:].strip()
+
+        for line in lines:
+            if line.startswith("parent "):
+                parent = line.split(" ")[1]
+            elif line.startswith("author "):
+                author_info = line[7:]
+
+        print(f"\033[33mcommit {current_hash}\033[0m") # Yellow text for hash
+        print(f"Author: {author_info}")
+        print(f"\n    {message}\n")
+        
+        current_hash = parent
+
+def cmd_status():
+    """Compares the Workspace, Index, and HEAD to show differences."""
+    index_entries = {e.path: e for e in read_index()}
+    
+    # Get all files in the current directory (skipping .git)
+    workspace_files = []
+    for root, _, files in os.walk("."):
+        if ".git" in root: continue
+        for f in files:
+            workspace_files.append(os.path.relpath(os.path.join(root, f), "."))
+
+    print("On branch master\n")
+
+    # Check for untracked or modified files
+    untracked = []
+    modified = []
+    for f_path in workspace_files:
+        if f_path not in index_entries:
+            untracked.append(f_path)
+        else:
+            # Hash the file on disk to see if it matches the index
+            with open(f_path, "rb") as f:
+                current_hash = hash_object(f.read(), write=False)
+            if current_hash != index_entries[f_path].sha1:
+                modified.append(f_path)
+
+    if modified:
+        print("Changes not staged for commit:")
+        for f in modified: print(f"  modified: {f}")
+        print()
+
+    if untracked:
+        print("Untracked files:")
+        for f in untracked: print(f"  {f}")
+
 def main():
     parser = argparse.ArgumentParser(description="A mini-git implementation from scratch.")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
@@ -282,8 +353,13 @@ def main():
 
     # checkout
     checkout_parser = subparsers.add_parser("checkout", help="Restore working tree files")
-    # We use "commit_hash" as the argument name to match your function parameter
     checkout_parser.add_argument("commit_hash", help="The SHA-1 hash of the commit to checkout")
+
+    # log
+    subparsers.add_parser("log", help="Display commit history")
+
+    # status
+    subparsers.add_parser("status", help="Show the working tree status")
 
     args = parser.parse_args()
 
@@ -298,6 +374,10 @@ def main():
         cmd_commit(args.message)
     elif args.command == "checkout":
         cmd_checkout(args.commit_hash)
+    elif args.command == "log":
+        cmd_log()
+    elif args.command == "status":
+        cmd_status()
     elif args.command is None:
         parser.print_help()
 

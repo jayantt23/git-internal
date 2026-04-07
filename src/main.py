@@ -3,6 +3,14 @@ import sys
 import os
 import hashlib
 import zlib
+import struct
+import collections
+import time
+
+IndexEntry = collections.namedtuple('IndexEntry', [
+    'ctime_s', 'ctime_n', 'mtime_s', 'mtime_n', 'dev', 'ino',
+    'mode', 'uid', 'gid', 'size', 'sha1', 'flags', 'path'
+])
 
 def cmd_init(repo_path="."):
     """Creates the basic Git directory structure."""
@@ -39,6 +47,87 @@ def hash_object(data, obj_type="blob", write=True):
     
     return sha1
     
+def read_index():
+    """Reads the binary index file and returns a list of IndexEntry objects."""
+    index_path = os.path.join(".git", "index")
+    if not os.path.exists(index_path):
+        return []
+    
+    with open(index_path, "rb") as f:
+        data = f.read()
+    
+    # Validation: Header is 12 bytes (DIRC + version + count)
+    signature = data[:4]
+    if signature != b"DIRC":
+        raise Exception("Not a valid Git index")
+    
+    count = struct.unpack("!I", data[8:12])[0]
+    
+    entries = []
+    offset = 12
+    for _ in range(count):
+        # Unpack the fixed-length part of the entry (62 bytes)
+        fields = list(struct.unpack("!LLLLLLLLLL20sH", data[offset:offset+62]))
+        
+        fields[10] = fields[10].hex()
+        
+        path_end = data.find(b"\x00", offset + 62)
+        path = data[offset+62:path_end].decode("utf-8")
+        
+        entry = IndexEntry(*fields, path)
+        entries.append(entry)
+        
+        # Entries are padded to 8-byte boundaries
+        entry_len = ((62 + len(path) + 8) // 8) * 8
+        offset += entry_len
+    
+    return entries
+
+def write_index(entries):
+    """Writes a list of IndexEntry objects to the binary index file."""
+    entries.sort(key=lambda x: x.path)
+    
+    header = b"DIRC" + struct.pack("!II", 2, len(entries))
+    body = b""
+    for e in entries:
+        path_bytes = e.path.encode("utf-8")
+        # Pack the fixed fields + SHA1 + Flags
+        entry_data = struct.pack("!LLLLLLLLLL20sH", 
+            e.ctime_s, e.ctime_n, e.mtime_s, e.mtime_n, e.dev, e.ino,
+            e.mode, e.uid, e.gid, e.size, bytes.fromhex(e.sha1), e.flags)
+        
+        # Add path and null-padding to 8-byte boundary
+        entry_data += path_bytes + b"\x00"
+        while len(entry_data) % 8 != 0:
+            entry_data += b"\x00"
+        body += entry_data
+
+    # Add a SHA-1 checksum of the content at the end
+    content = header + body
+    sha1_checksum = hashlib.sha1(content).digest()
+    
+    with open(os.path.join(".git", "index"), "wb") as f:
+        f.write(content + sha1_checksum)
+
+def cmd_add(paths):
+    """The entry point for the 'add' command."""
+    entries = {e.path: e for e in read_index()}
+    
+    for path in paths:
+        with open(path, "rb") as f:
+            data = f.read()
+            sha1 = hash_object(data, write=True)
+            
+            st = os.stat(path)
+            flags = len(path) & 0xFFF # Basic flags: just the path length
+            
+            entries[path] = IndexEntry(
+                int(st.st_ctime), 0, int(st.st_mtime), 0,
+                st.st_dev, st.st_ino, 0o100644, st.st_uid, st.st_gid,
+                st.st_size, sha1, flags, path
+            )
+            
+    write_index(list(entries.values()))
 
 def main():
     parser = argparse.ArgumentParser(description="A mini-git implementation from scratch.")
@@ -48,10 +137,14 @@ def main():
     init_parser = subparsers.add_parser("init", help="Initialize a new repo")
     init_parser.add_argument("path", default=".", nargs="?", help="Where to create the repository")
     
-    # hash-object
-    hash_parser = subparsers.add_parser("hash-object")
+    # hash-object command
+    hash_parser = subparsers.add_parser("hash-object", help="Hash object and optionally write to database")
     hash_parser.add_argument("file", help="The file to hash")
     hash_parser.add_argument("-w", action="store_true", help="Write the object to the database")
+
+    # add command
+    add_parser = subparsers.add_parser("add", help="Add file contents to the index")
+    add_parser.add_argument("paths", nargs="+", help="Files to add to the index")
 
     args = parser.parse_args()
 
@@ -60,6 +153,8 @@ def main():
     elif args.command == "hash-object":
         with open(args.file, "rb") as f:
             print(hash_object(f.read(), write=args.w))
+    elif args.command == "add":
+        cmd_add(args.paths)
     elif args.command is None:
         parser.print_help()
 

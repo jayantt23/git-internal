@@ -129,22 +129,71 @@ def cmd_add(paths):
             
     write_index(list(entries.values()))
 
+def write_tree():
+    """Converts the current Index into a Tree object and returns its SHA-1."""
+    entries = read_index()
+    tree_content = b""
+    
+    for e in entries:
+        # Format: [mode] [path]\x00[20-byte binary SHA-1]
+        mode_path = f"{e.mode:o} {e.path}".encode("utf-8")
+        tree_content += mode_path + b"\x00" + bytes.fromhex(e.sha1)
+        
+    return hash_object(tree_content, obj_type="tree")
+
+def cmd_commit(message, author="Jayant Sharma <jayant@example.com>"):
+    """Creates a commit object and updates the master branch."""
+    tree_sha1 = write_tree()
+    
+    # Check if there's a parent commit (the current hash in refs/heads/master)
+    master_path = os.path.join(".git", "refs", "heads", "master")
+    parent = None
+    if os.path.exists(master_path):
+        with open(master_path, "r") as f:
+            parent = f.read().strip()
+
+    # Build the commit object content
+    now = int(time.time())
+    timezone = "+0530"
+    
+    content = f"tree {tree_sha1}\n"
+    if parent:
+        content += f"parent {parent}\n"
+    content += f"author {author} {now} {timezone}\n"
+    content += f"committer {author} {now} {timezone}\n"
+    content += f"\n{message}\n"
+    
+    # Save the commit object
+    commit_sha1 = hash_object(content.encode("utf-8"), obj_type="commit")
+    
+    # Update the master branch pointer to this new commit
+    os.makedirs(os.path.dirname(master_path), exist_ok=True)
+    with open(master_path, "w") as f:
+        f.write(commit_sha1 + "\n")
+        
+    print(f"[{commit_sha1[:7]}] {message}")
+    return commit_sha1
+
 def main():
     parser = argparse.ArgumentParser(description="A mini-git implementation from scratch.")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
-    # init command
+    # init
     init_parser = subparsers.add_parser("init", help="Initialize a new repo")
     init_parser.add_argument("path", default=".", nargs="?", help="Where to create the repository")
     
-    # hash-object command
+    # hash-object
     hash_parser = subparsers.add_parser("hash-object", help="Hash object and optionally write to database")
     hash_parser.add_argument("file", help="The file to hash")
     hash_parser.add_argument("-w", action="store_true", help="Write the object to the database")
 
-    # add command
+    # add
     add_parser = subparsers.add_parser("add", help="Add file contents to the index")
     add_parser.add_argument("paths", nargs="+", help="Files to add to the index")
+
+    # commit
+    commit_parser = subparsers.add_parser("commit", help="Record changes to the repository")
+    commit_parser.add_argument("-m", "--message", required=True, help="The commit message")
 
     args = parser.parse_args()
 
@@ -155,6 +204,8 @@ def main():
             print(hash_object(f.read(), write=args.w))
     elif args.command == "add":
         cmd_add(args.paths)
+    elif args.command == "commit":
+        cmd_commit(args.message) # Calls your function with the -m text
     elif args.command is None:
         parser.print_help()
 

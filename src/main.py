@@ -174,6 +174,91 @@ def cmd_commit(message, author="Jayant Sharma <jayant@example.com>"):
     print(f"[{commit_sha1[:7]}] {message}")
     return commit_sha1
 
+def read_tree(tree_sha1):
+    """Parses a tree object and returns a list of (mode, path, sha1)."""
+    obj_type, data = read_object(tree_sha1)
+    if obj_type != "tree":
+        raise Exception(f"Object {tree_sha1} is not a tree")
+
+    entries = []
+    i = 0
+    while i < len(data):
+        # Format: [mode] [path]\x00[20-byte SHA-1]
+        space_pos = data.find(b" ", i)
+        null_pos = data.find(b"\x00", space_pos)
+        
+        mode = data[i:space_pos].decode()
+        path = data[space_pos + 1:null_pos].decode()
+        sha1 = data[null_pos + 1:null_pos + 21].hex()
+        
+        entries.append((mode, path, sha1))
+        i = null_pos + 21
+    return entries
+
+def resolve_sha1(short_sha):
+    """Finds a full 40-char SHA-1 from a prefix."""
+    if len(short_sha) == 40:
+        return short_sha
+    
+    if len(short_sha) < 4:
+        raise Exception("Prefix too short (ambiguous)")
+
+    obj_dir = os.path.join(".git", "objects", short_sha[:2])
+    if not os.path.exists(obj_dir):
+        return None
+    
+    prefix = short_sha[2:]
+    matches = [f for f in os.listdir(obj_dir) if f.startswith(prefix)]
+    
+    if not matches:
+        return None
+    if len(matches) > 1:
+        raise Exception(f"Ambiguous prefix {short_sha}: matches {len(matches)} objects")
+        
+    return short_sha[:2] + matches[0]
+
+def read_object(sha1_prefix):
+    """Helper to read and decompress an object from the store."""
+    sha1 = resolve_sha1(sha1_prefix)
+    if not sha1:
+        raise Exception(f"Object {sha1_prefix} not found")
+        
+    path = os.path.join(".git", "objects", sha1[:2], sha1[2:])
+    with open(path, "rb") as f:
+        raw = zlib.decompress(f.read())
+        
+    header, content = raw.split(b"\x00", 1)
+    obj_type, size = header.decode().split(" ")
+    return obj_type, content
+
+def cmd_checkout(commit_hash):
+    """Restores the working directory to the state of a specific commit."""
+    # Get the Tree hash from the Commit
+    obj_type, data = read_object(commit_hash)
+    if obj_type != "commit":
+        raise Exception("Can only checkout commits")
+    
+    # Simple parsing to find the 'tree' line
+    lines = data.decode().splitlines()
+    tree_sha1 = lines[0].split(" ")[1]
+
+    # Recursively write files from the tree
+    def unpack_tree(sha1, base_path="."):
+        entries = read_tree(sha1)
+        for mode, path, entry_sha1 in entries:
+            full_path = os.path.join(base_path, path)
+            
+            obj_type, content = read_object(entry_sha1)
+            if obj_type == "blob":
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, "wb") as f:
+                    f.write(content)
+
+    unpack_tree(tree_sha1)
+    
+    # Update the Index to match this commit
+    print(f"Switched to commit {commit_hash[:7]}")
+
 def main():
     parser = argparse.ArgumentParser(description="A mini-git implementation from scratch.")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
@@ -195,6 +280,11 @@ def main():
     commit_parser = subparsers.add_parser("commit", help="Record changes to the repository")
     commit_parser.add_argument("-m", "--message", required=True, help="The commit message")
 
+    # checkout
+    checkout_parser = subparsers.add_parser("checkout", help="Restore working tree files")
+    # We use "commit_hash" as the argument name to match your function parameter
+    checkout_parser.add_argument("commit_hash", help="The SHA-1 hash of the commit to checkout")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -205,7 +295,9 @@ def main():
     elif args.command == "add":
         cmd_add(args.paths)
     elif args.command == "commit":
-        cmd_commit(args.message) # Calls your function with the -m text
+        cmd_commit(args.message)
+    elif args.command == "checkout":
+        cmd_checkout(args.commit_hash)
     elif args.command is None:
         parser.print_help()
 

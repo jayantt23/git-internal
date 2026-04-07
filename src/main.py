@@ -315,10 +315,17 @@ def cmd_status():
         if f_path not in index_entries:
             untracked.append(f_path)
         else:
-            # Hash the file on disk to see if it matches the index
+            entry = index_entries[f_path]
+            stat = os.stat(f_path)
+            
+            # O(1) Check: Compare metadata before doing heavy hashing
+            if int(stat.st_mtime) == entry.mtime_s and int(stat.st_size) == entry.size:
+                continue
+                
+            # If metadata differs, then we do the O(N) hash check
             with open(f_path, "rb") as f:
                 current_hash = hash_object(f.read(), write=False)
-            if current_hash != index_entries[f_path].sha1:
+            if current_hash != entry.sha1:
                 modified.append(f_path)
 
     if modified:

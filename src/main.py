@@ -6,11 +6,7 @@ import zlib
 import struct
 import collections
 import time
-
-IndexEntry = collections.namedtuple('IndexEntry', [
-    'ctime_s', 'ctime_n', 'mtime_s', 'mtime_n', 'dev', 'ino',
-    'mode', 'uid', 'gid', 'size', 'sha1', 'flags', 'path'
-])
+import subprocess
 
 def cmd_init(repo_path="."):
     """Creates the basic Git directory structure."""
@@ -46,7 +42,12 @@ def hash_object(data, obj_type="blob", write=True):
                 f.write(zlib.compress(full_data))
     
     return sha1
-    
+
+IndexEntry = collections.namedtuple('IndexEntry', [
+    'ctime_s', 'ctime_n', 'mtime_s', 'mtime_n', 'dev', 'ino',
+    'mode', 'uid', 'gid', 'size', 'sha1', 'flags', 'path'
+])
+   
 def read_index():
     """Reads the binary index file and returns a list of IndexEntry objects."""
     index_path = os.path.join(".git", "index")
@@ -56,23 +57,28 @@ def read_index():
     with open(index_path, "rb") as f:
         data = f.read()
     
+    digest = hashlib.sha1(data[:-20]).digest()
+    if digest != data[-20:]:    
+        raise Exception("Invalid index checksum")
+    
     # Validation: Header is 12 bytes (DIRC + version + count)
-    signature = data[:4]
+    signature, version, count = struct.unpack('!4sLL', data[:12])
     if signature != b"DIRC":
         raise Exception("Not a valid Git index")
+    if version != 2:
+        raise Exception("Unknown index version")
     
-    count = struct.unpack("!I", data[8:12])[0]
-    
+    entry_data = data[12:-20]
     entries = []
-    offset = 12
-    for _ in range(count):
+    offset = 0
+    while offset + 62 < len(entry_data):
         # Unpack the fixed-length part of the entry (62 bytes)
-        fields = list(struct.unpack("!LLLLLLLLLL20sH", data[offset:offset+62]))
+        fields = list(struct.unpack("!LLLLLLLLLL20sH", entry_data[offset:offset+62]))
         
         fields[10] = fields[10].hex()
         
-        path_end = data.find(b"\x00", offset + 62)
-        path = data[offset+62:path_end].decode("utf-8")
+        path_end = entry_data.find(b"\x00", offset + 62)
+        path = entry_data[offset+62:path_end].decode("utf-8")
         
         entry = IndexEntry(*fields, path)
         entries.append(entry)
@@ -81,6 +87,8 @@ def read_index():
         entry_len = ((62 + len(path) + 8) // 8) * 8
         offset += entry_len
     
+    if len(entries) != count:
+        raise Exception("Parsed entry count does not match header declaration")
     return entries
 
 def write_index(entries):
@@ -93,8 +101,19 @@ def write_index(entries):
         path_bytes = e.path.encode("utf-8")
         # Pack the fixed fields + SHA1 + Flags
         entry_data = struct.pack("!LLLLLLLLLL20sH", 
-            e.ctime_s, e.ctime_n, e.mtime_s, e.mtime_n, e.dev, e.ino,
-            e.mode, e.uid, e.gid, e.size, bytes.fromhex(e.sha1), e.flags)
+            e.ctime_s & 0xFFFFFFFF, 
+            e.ctime_n & 0xFFFFFFFF, 
+            e.mtime_s & 0xFFFFFFFF, 
+            e.mtime_n & 0xFFFFFFFF, 
+            e.dev & 0xFFFFFFFF, 
+            e.ino & 0xFFFFFFFF,
+            e.mode & 0xFFFFFFFF, 
+            e.uid & 0xFFFFFFFF, 
+            e.gid & 0xFFFFFFFF, 
+            e.size & 0xFFFFFFFF, 
+            bytes.fromhex(e.sha1), 
+            e.flags & 0xFFFF
+        )
         
         # Add path and null-padding to 8-byte boundary
         entry_data += path_bytes + b"\x00"
@@ -113,44 +132,114 @@ def cmd_add(paths):
     """The entry point for the 'add' command."""
     entries = {e.path: e for e in read_index()}
     
+    expanded_paths = []
     for path in paths:
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                if ".git" in dirs:
+                    dirs.remove(".git")
+
+                for file in files:
+                    clean_path = os.path.normpath(os.path.join(root, file))
+                    clean_path = clean_path.replace("\\", "/")
+                    expanded_paths.append(clean_path)
+        else:
+            clean_path = os.path.normpath(path)
+            clean_path = clean_path.replace("\\", "/")
+            expanded_paths.append(clean_path)
+    
+    for path in expanded_paths:
+        st = os.stat(path)
+        
+        if path in entries:
+            existing = entries[path]
+            if existing.mtime_s == int(st.st_mtime) and existing.size == st.st_size:
+                continue
+        
         with open(path, "rb") as f:
             data = f.read()
             sha1 = hash_object(data, write=True)
             
-            st = os.stat(path)
-            flags = len(path) & 0xFFF # Basic flags: just the path length
+        flags = len(path) & 0xFFF # Basic flags: just the path length
             
-            entries[path] = IndexEntry(
-                int(st.st_ctime), 0, int(st.st_mtime), 0,
-                st.st_dev, st.st_ino, 0o100644, st.st_uid, st.st_gid,
-                st.st_size, sha1, flags, path
-            )
+        entries[path] = IndexEntry(
+            int(st.st_ctime), 0, int(st.st_mtime), 0,
+            st.st_dev, st.st_ino, 0o100644, st.st_uid, st.st_gid,
+            st.st_size, sha1, flags, path
+        )
             
     write_index(list(entries.values()))
 
 def write_tree():
-    """Converts the current Index into a Tree object and returns its SHA-1."""
+    """Converts the current Index into a recursive Tree object and returns its SHA-1."""
     entries = read_index()
-    tree_content = b""
     
-    for e in entries:
-        # Format: [mode] [path]\x00[20-byte binary SHA-1]
-        mode_path = f"{e.mode:o} {e.path}".encode("utf-8")
-        tree_content += mode_path + b"\x00" + bytes.fromhex(e.sha1)
+    root_tree = {}
+    for entry in entries:
+        parts = entry.path.split("/")
+        current = root_tree
         
-    return hash_object(tree_content, obj_type="tree")
+        for folder in parts[:-1]:
+            if folder not in current:
+                current[folder] = {}
+            current = current[folder]
+        
+        current[parts[-1]] = entry
+    
+    def build_tree_object(node):
+        tree_content = b""
+        
+        for name, item in sorted(node.items()):
+            if isinstance(item, dict):
+                mode = "40000" # Git's standard octal mode for a directory
+                item_sha1 = build_tree_object(item)
+            else:
+                mode = f"{item.mode:o}"
+                item_sha1 = item.sha1
+        
+            mode_name = f"{mode} {name}".encode("utf-8")
+            tree_content += mode_name + b"\x00" + bytes.fromhex(item_sha1)
+
+        return hash_object(tree_content, obj_type="tree")
+    
+    return build_tree_object(root_tree)
 
 def cmd_commit(message, author="Jayant Sharma <jayant@example.com>"):
-    """Creates a commit object and updates the master branch."""
+    """Creates a commit object and updates the current branch."""
     tree_sha1 = write_tree()
     
-    # Check if there's a parent commit (the current hash in refs/heads/master)
-    master_path = os.path.join(".git", "refs", "heads", "master")
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+    
+    is_detached = False
     parent = None
-    if os.path.exists(master_path):
-        with open(master_path, "r") as f:
-            parent = f.read().strip()
+    branch_path = None
+    
+    if head_content.startswith("ref: "):
+        # Normal state: HEAD points to a branch
+        ref_path = head_content[5:]
+        branch_path = os.path.join(".git", *ref_path.split("/"))
+        
+        # Check if there's a parent commit on this branch
+        if os.path.exists(branch_path):
+            with open(branch_path, "r") as f:
+                parent = f.read().strip()
+    else:
+        # Detached HEAD state: HEAD directly contains the parent commit hash
+        is_detached = True
+        parent = head_content
+
+    if parent:
+        obj_type, parent_data = read_object(parent)
+        if obj_type == "commit":
+            lines = parent_data.decode().splitlines()
+            parent_tree_sha1 = lines[0].split(" ")[1]
+            
+            # If the current staging area perfectly matches the parent commit, abort!
+            if tree_sha1 == parent_tree_sha1:
+                print("nothing to commit, working tree clean")
+                return None
 
     # Build the commit object content
     now = int(time.time())
@@ -166,10 +255,15 @@ def cmd_commit(message, author="Jayant Sharma <jayant@example.com>"):
     # Save the commit object
     commit_sha1 = hash_object(content.encode("utf-8"), obj_type="commit")
     
-    # Update the master branch pointer to this new commit
-    os.makedirs(os.path.dirname(master_path), exist_ok=True)
-    with open(master_path, "w") as f:
-        f.write(commit_sha1 + "\n")
+    if is_detached:
+        # In detached HEAD, we update the HEAD file directly
+        with open(head_path, "w") as f:
+            f.write(commit_sha1 + "\n")
+    else:
+        # Otherwise, update the dynamic branch pointer
+        os.makedirs(os.path.dirname(branch_path), exist_ok=True)
+        with open(branch_path, "w") as f:
+            f.write(commit_sha1 + "\n")
         
     print(f"[{commit_sha1[:7]}] {message}")
     return commit_sha1
@@ -224,6 +318,14 @@ def read_object(sha1_prefix):
         raise Exception(f"Object {sha1_prefix} not found")
         
     path = os.path.join(".git", "objects", sha1[:2], sha1[2:])
+    
+    if not os.path.exists(path):
+        try:
+            obj_type = subprocess.check_output(["git", "cat-file", "-t", sha1]).decode().strip()
+            content = subprocess.check_output(["git", "cat-file", obj_type, sha1])
+            return obj_type, content
+        except subprocess.CalledProcessError:
+            raise Exception(f"Object {sha1} is missing from the repository.")
     with open(path, "rb") as f:
         raw = zlib.decompress(f.read())
         
@@ -231,8 +333,22 @@ def read_object(sha1_prefix):
     obj_type, size = header.decode().split(" ")
     return obj_type, content
 
-def cmd_checkout(commit_hash):
-    """Restores the working directory to the state of a specific commit."""
+def cmd_checkout(target):
+    """Restores the working directory to the state of a specific commit or branch."""
+    
+    branch_path = os.path.join(".git", "refs", "heads", target)
+    is_branch = os.path.exists(branch_path)
+    
+    if is_branch:
+        # If it's a branch, read the commit hash from the branch file
+        with open(branch_path, "r") as f:
+            commit_hash = f.read().strip()
+    else:
+        # Otherwise, assume the user passed a commit hash
+        commit_hash = resolve_sha1(target)
+        if not commit_hash:
+            raise Exception(f"Commit {target} not found")
+    
     # Get the Tree hash from the Commit
     obj_type, data = read_object(commit_hash)
     if obj_type != "commit":
@@ -253,8 +369,21 @@ def cmd_checkout(commit_hash):
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
                 with open(full_path, "wb") as f:
                     f.write(content)
+            elif obj_type == "tree":
+                unpack_tree(entry_sha1, full_path)
 
     unpack_tree(tree_sha1)
+    
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "w") as f:
+        if is_branch:
+            # Reattach HEAD to the branch
+            f.write(f"ref: refs/heads/{target}\n")
+            print(f"Switched to branch '{target}'")
+        else:
+            # Detach HEAD to the specific commit
+            f.write(commit_hash + "\n")
+            print(f"Switched to detached HEAD at {commit_hash[:7]}")
     
     # Update the Index to match this commit
     print(f"Switched to commit {commit_hash[:7]}")

@@ -391,13 +391,24 @@ def cmd_checkout(target):
 def cmd_log():
     """Traverses the commit graph and prints the history."""
     # Find the starting point (the latest commit hash)
-    master_path = os.path.join(".git", "refs", "heads", "master")
-    if not os.path.exists(master_path):
-        print("No commits yet.")
-        return
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+    
+    if head_content.startswith("ref: "):
+        # Normal state: HEAD points to a branch
+        ref_path = head_content[5:]
+        branch_path = os.path.join(".git", *ref_path.split("/"))
 
-    with open(master_path, "r") as f:
-        current_hash = f.read().strip()
+        if not os.path.exists(branch_path):
+            print("No commits yet.")
+            return
+
+        with open(branch_path, "r") as f:
+            current_hash = f.read().strip()
+    else:
+        # Detached HEAD state: HEAD directly contains the commit hash
+        current_hash = head_content
 
     # Walk backwards through the parents
     while current_hash:
@@ -428,14 +439,30 @@ def cmd_status():
     """Compares the Workspace, Index, and HEAD to show differences."""
     index_entries = {e.path: e for e in read_index()}
     
+    head_path = os.path.join(".git", "HEAD")
+    if os.path.exists(head_path):
+        with open(head_path, "r") as f:
+            head_content = f.read().strip()
+            
+        if head_content.startswith("ref: "):
+            # Extract just the branch name from refs/heads/branch_name
+            branch_name = head_content.split("/")[-1]
+            print(f"On branch {branch_name}\n")
+        else:
+            # We are in a detached HEAD state
+            print(f"HEAD detached at {head_content[:7]}\n")
+    else:
+        print("Fatal: Not a git repository")
+        return
+    
     # Get all files in the current directory (skipping .git)
     workspace_files = []
     for root, _, files in os.walk("."):
         if ".git" in root: continue
         for f in files:
-            workspace_files.append(os.path.relpath(os.path.join(root, f), "."))
-
-    print("On branch master\n")
+            rel_path = os.path.relpath(os.path.join(root, f), ".")
+            normalized_path = rel_path.replace("\\", "/")
+            workspace_files.append(normalized_path)
 
     # Check for untracked or modified files
     untracked = []
@@ -465,6 +492,195 @@ def cmd_status():
     if untracked:
         print("Untracked files:")
         for f in untracked: print(f"  {f}")
+    
+    if not modified and not untracked:
+        print("nothing to commit, working tree clean")
+
+def cmd_branch(branch_name=None):
+    """Creates a new branch or lists existing branches."""
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+
+    # Figure out where we are currently
+    if head_content.startswith("ref: "):
+        current_branch = head_content.split("/")[-1]
+        branch_path = os.path.join(".git", *head_content[5:].split("/"))
+        with open(branch_path, "r") as f:
+            current_hash = f.read().strip()
+    else:
+        current_branch = "HEAD (detached)"
+        current_hash = head_content
+
+    if branch_name:
+        # Create a new branch
+        new_branch_path = os.path.join(".git", "refs", "heads", branch_name)
+        if os.path.exists(new_branch_path):
+            print(f"fatal: A branch named '{branch_name}' already exists.")
+            return
+        
+        os.makedirs(os.path.dirname(new_branch_path), exist_ok=True)
+        with open(new_branch_path, "w") as f:
+            f.write(current_hash + "\n")
+        print(f"Created branch '{branch_name}' at {current_hash[:7]}")
+    else:
+        # List existing branches
+        heads_dir = os.path.join(".git", "refs", "heads")
+        if not os.path.exists(heads_dir):
+            return
+        
+        branches = os.listdir(heads_dir)
+        for b in sorted(branches):
+            if b == current_branch:
+                print(f"* \033[32m{b}\033[0m") # Green text for active branch
+            else:
+                print(f"  {b}")
+        
+        if current_branch == "HEAD (detached)":
+            print(f"* \033[32m(HEAD detached at {current_hash[:7]})\033[0m")
+
+def cmd_stats():
+    """Analyzes the current commit and prints repository statistics."""
+
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+        
+    if head_content.startswith("ref: "):
+        branch_path = os.path.join(".git", *head_content[5:].split("/"))
+        if not os.path.exists(branch_path):
+            print("No commits yet to analyze.")
+            return
+        with open(branch_path, "r") as f:
+            current_hash = f.read().strip()
+    else:
+        current_hash = head_content
+
+    # Get the Tree hash from the Commit
+    obj_type, data = read_object(current_hash)
+    lines = data.decode().splitlines()
+    tree_sha1 = lines[0].split(" ")[1]
+
+    # Analytics variables
+    total_files = 0
+    total_size = 0
+    extensions = collections.defaultdict(int)
+
+    # Recursively traverse the tree to gather stats
+    def analyze_tree(sha1):
+        nonlocal total_files, total_size, extensions
+        entries = read_tree(sha1)
+        
+        for mode, path, entry_sha1 in entries:
+            obj_type, content = read_object(entry_sha1)
+            
+            if obj_type == "blob":
+                total_files += 1
+                total_size += len(content)
+                
+                # Extract file extension
+                ext = os.path.splitext(path)[1]
+                if ext:
+                    extensions[ext] += 1
+                else:
+                    extensions["(no extension)"] += 1
+                    
+            elif obj_type == "tree":
+                analyze_tree(entry_sha1)
+
+    analyze_tree(tree_sha1)
+    
+    # Print the results
+    print(f"\nRepository Stats (Commit {current_hash[:7]})")
+    print("-" * 40)
+    print(f"Total Files: {total_files}")
+    print(f"Total Size:  {total_size / 1024:.2f} KB")
+    print("\nFile Breakdown:")
+    for ext, count in sorted(extensions.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {ext}: {count} files")
+    print("-" * 40 + "\n")
+
+def cmd_rewind(steps=1):
+    """Safely undoes the last N commits without touching the workspace."""
+    steps = int(steps)
+    
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+        
+    is_detached = not head_content.startswith("ref: ")
+    if is_detached:
+        current_hash = head_content
+        ref_to_update = head_path
+    else:
+        branch_path = os.path.join(".git", *head_content[5:].split("/"))
+        with open(branch_path, "r") as f:
+            current_hash = f.read().strip()
+        ref_to_update = branch_path
+
+    # Walk backward 'N' times to find the target ancestor
+    target_hash = current_hash
+    for i in range(steps):
+        obj_type, data = read_object(target_hash)
+        content = data.decode()
+        
+        parent = None
+        for line in content.splitlines():
+            if line.startswith("parent "):
+                parent = line.split(" ")[1]
+                break
+                
+        if not parent:
+            print(f"Reached the beginning of history. Can only rewind {i} steps.")
+            break
+        target_hash = parent
+
+    # Update the pointer to officially "rewind" time
+    if target_hash != current_hash:
+        with open(ref_to_update, "w") as f:
+            f.write(target_hash + "\n")
+        print(f"Rewound {steps} commit(s).")
+        print(f"HEAD is now at {target_hash[:7]}.")
+        print("Your files were not changed. Run 'python3 main.py status' to see your uncommitted work.")
+
+def cmd_graph():
+    """Prints a beautiful ASCII visual graph of the commit history."""
+    head_path = os.path.join(".git", "HEAD")
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+        
+    if head_content.startswith("ref: "):
+        branch_path = os.path.join(".git", *head_content[5:].split("/"))
+        if not os.path.exists(branch_path):
+            print("No commits yet.")
+            return
+        with open(branch_path, "r") as f:
+            current_hash = f.read().strip()
+    else:
+        current_hash = head_content
+
+    print("\nCommit History Graph:")
+    
+    while current_hash:
+        obj_type, data = read_object(current_hash)
+        content = data.decode()
+        
+        lines = content.splitlines()
+        parent = None
+        message = content[content.find("\n\n"):].strip().split('\n')[0] # Get just the first line of the message
+
+        for line in lines:
+            if line.startswith("parent "):
+                parent = line.split(" ")[1]
+
+        # Draw the node
+        print(f" * \033[33m{current_hash[:7]}\033[0m {message}")
+        
+        if parent:
+            print(" |")
+            
+        current_hash = parent
+    print("\n")
 
 def main():
     parser = argparse.ArgumentParser(description="A mini-git implementation from scratch.")
@@ -496,6 +712,20 @@ def main():
 
     # status
     subparsers.add_parser("status", help="Show the working tree status")
+    
+    # branch
+    branch_parser = subparsers.add_parser("branch", help="List or create branches")
+    branch_parser.add_argument("name", nargs="?", help="Name of the new branch")
+    
+    # stats
+    subparsers.add_parser("stats", help="Show repository statistics")
+    
+    # rewind
+    rewind_parser = subparsers.add_parser("rewind", help="Undo the last N commits safely")
+    rewind_parser.add_argument("steps", nargs="?", default=1, type=int, help="Number of commits to undo")
+    
+    # graph
+    subparsers.add_parser("graph", help="Show visual commit graph")
 
     args = parser.parse_args()
 
@@ -514,6 +744,14 @@ def main():
         cmd_log()
     elif args.command == "status":
         cmd_status()
+    elif args.command == "branch":
+        cmd_branch(args.name)
+    elif args.command == "stats":
+        cmd_stats()
+    elif args.command == "rewind":
+        cmd_rewind(args.steps)
+    elif args.command == "graph":
+        cmd_graph()
     elif args.command is None:
         parser.print_help()
 
